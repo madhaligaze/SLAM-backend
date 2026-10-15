@@ -92,6 +92,22 @@ class SubmitIn(BaseModel):
     names: Optional[List[FullName]] = Field(default=None, max_length=100)
 
 
+class PhoneJobIn(BaseModel):
+    """Телефон начинает отправку бригады (форму заполняет сам телефон)."""
+    id: str = Field(..., min_length=8, max_length=32, pattern=r"^[A-Za-z0-9_-]+$")
+    names: List[FullName] = Field(..., min_length=1, max_length=100)
+    submit: bool = True
+    base: dict = Field(default_factory=dict)     # workplace, task, object_key, company, device
+
+
+class PhoneJobUpdate(BaseModel):
+    status: Literal["running", "done", "error"]
+    done: int = Field(..., ge=0)
+    results: List[dict] = Field(..., max_length=100)
+    fields: Optional[List[list]] = None          # протокол — обычно только в конце
+    finished_at: Optional[str] = Field(default=None, max_length=40)
+
+
 class PreviewIn(BaseModel):
     """Что именно движок напишет в форму — для плашки предпросмотра."""
     full_name: str = Field(default="", max_length=300)
@@ -288,6 +304,32 @@ def submit_block(block_id: int, data: SubmitIn, s: Session = Depends(db)):
     except JobBusy:
         raise HTTPException(409, "По этой бригаде уже идёт отправка")
     return job.to_dict()
+
+
+@app.post("/api/blocks/{block_id}/phone-jobs")
+def phone_job_start(block_id: int, data: PhoneJobIn, s: Session = Depends(db)):
+    """Телефон сообщает, что начинает отправку бригады.
+
+    Форму заполняет сам телефон — сервер только хранит ход и итог, чтобы
+    их видели все бригадиры, и не даёт отправить бригаду дважды (409)."""
+    b = s.get(Block, block_id)
+    if not b:
+        raise HTTPException(404, "Блок не найден")
+    try:
+        return jobs.phone_start(b.id, b.name, data.id, [n.strip() for n in data.names],
+                                data.base, data.submit)
+    except JobBusy:
+        raise HTTPException(409, "По этой бригаде уже идёт отправка")
+
+
+@app.put("/api/phone-jobs/{job_id}")
+def phone_job_update(job_id: str, data: PhoneJobUpdate):
+    """Ход отправки с телефона: после каждого работника и в конце."""
+    job = jobs.phone_update(job_id, data.status, data.done, data.results,
+                            data.fields, data.finished_at)
+    if job is None:
+        raise HTTPException(404, "Отправка с телефона не найдена")
+    return job
 
 
 @app.get("/api/blocks/{block_id}/job")

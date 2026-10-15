@@ -4,7 +4,7 @@ import os
 import datetime as dt
 from typing import Optional
 from sqlalchemy import (create_engine, Integer, String, Text, DateTime, ForeignKey,
-                        Boolean, JSON)
+                        Boolean, JSON, inspect, text)
 from sqlalchemy.orm import (DeclarativeBase, Mapped, mapped_column, relationship,
                             sessionmaker)
 
@@ -95,6 +95,12 @@ class JobRecord(Base):
     block_id: Mapped[Optional[int]] = mapped_column(Integer, index=True, nullable=True)
     block_name: Mapped[str] = mapped_column(String(200), default="")
     status: Mapped[str] = mapped_column(String(20), default="queued")   # queued|running|done|error
+    # server — заполняет движок этого сервера; phone — приложение на телефоне,
+    # оно присылает ход отправки само (сервер тогда только хранит и показывает).
+    source: Mapped[str] = mapped_column(String(20), default="server")
+    # Последний признак жизни. Отправка с телефона, о которой давно ничего не
+    # слышно, считается оборвавшейся (телефон разрядился, приложение убили).
+    updated_at: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     submit: Mapped[bool] = mapped_column(Boolean, default=True)
     total: Mapped[int] = mapped_column(Integer, default=0)
     done: Mapped[int] = mapped_column(Integer, default=0)
@@ -110,6 +116,21 @@ class JobRecord(Base):
 
 def init_db():
     Base.metadata.create_all(engine)
+    _add_missing_columns()
+
+
+def _add_missing_columns():
+    """create_all создаёт недостающие таблицы, но не колонки. Колонки jobs,
+    появившиеся после первого выката таблицы, добавляем сами."""
+    cols = {c["name"] for c in inspect(engine).get_columns("jobs")}
+    added = {
+        "source": "VARCHAR(20) DEFAULT 'server'",
+        "updated_at": "VARCHAR(40)",
+    }
+    with engine.begin() as conn:
+        for name, ddl in added.items():
+            if name not in cols:
+                conn.execute(text(f"ALTER TABLE jobs ADD COLUMN {name} {ddl}"))
 
 
 def get_session():

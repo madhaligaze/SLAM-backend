@@ -8,6 +8,11 @@
 Задача не зависит от клиента: бригадир может свернуть приложение или закрыть
 вкладку — поток доработает сам. Состояние пишется в БД (таблица jobs), чтобы
 вернувшийся клиент мог найти задачу своей бригады и показать ход и итог.
+
+Отправки, которые выполняет приложение на телефоне (source=phone), сервер не
+выполняет, а только хранит: телефон сам присылает ход и итог. Так все
+бригадиры видят, что бригада уже отправляется или отправлена, а две
+отправки одной бригады одновременно не запустятся.
 """
 import copy
 import datetime as dt
@@ -15,6 +20,8 @@ import threading
 import uuid
 from collections import OrderedDict
 from typing import Dict, Iterable, List, Optional
+
+from sqlalchemy import or_
 
 from db import JobRecord, get_session
 from engine.slam_filler import SlamFiller, WorkerData
@@ -25,10 +32,31 @@ MAX_JOBS = 200
 # Сколько последних задач одной бригады хранить в БД.
 KEEP_PER_BLOCK = 10
 ACTIVE = ("queued", "running")
+# Отправка с телефона без вестей дольше этого считается оборвавшейся.
+PHONE_STALE = dt.timedelta(minutes=10)
 
 
 def _now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds")
+
+
+def _interrupt(results: list, why_running: str, why_pending: str) -> list:
+    """Кто был в работе — «не подтверждено» (форма могла уйти), до кого
+    очередь не дошла — «ошибка»."""
+    out = copy.deepcopy(results or [])
+    for r in out:
+        if r.get("status") == "running":
+            r["status"] = "unconfirmed"
+            r["errors"] = (r.get("errors") or []) + [why_running]
+        elif r.get("status") == "pending":
+            r["status"] = "failed"
+            r["errors"] = (r.get("errors") or []) + [why_pending]
+    return out
+
+
+def _server_jobs():
+    # source=NULL — записи, созданные до появления колонки: это задачи сервера.
+    return or_(JobRecord.source.is_(None), JobRecord.source == "server")
 
 
 def _light(result: dict) -> dict:
@@ -56,7 +84,8 @@ def _summary(job: dict) -> dict:
 def _record_dict(rec: JobRecord) -> dict:
     return {
         "id": rec.id, "block_id": rec.block_id, "block_name": rec.block_name,
-        "status": rec.status, "submit": rec.submit, "total": rec.total,
+        "status": rec.status, "source": rec.source or "server",
+        "submit": rec.submit, "total": rec.total,
         "done": rec.done, "created_at": rec.created_at,
         "started_at": rec.started_at, "finished_at": rec.finished_at,
         "base": dict(rec.base or {}), "results": copy.deepcopy(rec.results or []),
@@ -66,9 +95,16 @@ def _record_dict(rec: JobRecord) -> dict:
 class JobBusy(Exception):
     """По бригаде уже идёт отправка — вторая отправила бы формы повторно."""
 
-    def __init__(self, job: "Job"):
+    def __init__(self, job):
         super().__init__(job.id)
         self.job = job
+
+
+class _RecordRef:
+    """Ссылка на идущую отправку с телефона (для JobBusy)."""
+
+    def __init__(self, job_id: str):
+        self.id = job_id
 
 
 class Job:
@@ -99,7 +135,8 @@ class Job:
         with self._lock:
             return {
                 "id": self.id, "block_id": self.block_id, "block_name": self.block_name,
-                "status": self.status, "submit": self.submit, "total": self.total,
+                "status": self.status, "source": "server",
+                "submit": self.submit, "total": self.total,
                 "done": self.done, "created_at": self.created_at,
                 "started_at": self.started_at, "finished_at": self.finished_at,
                 "base": dict(self.base), "results": copy.deepcopy(self.results),
@@ -169,9 +206,10 @@ class JobManager:
         try:
             with get_session() as s:
                 rec = s.get(JobRecord, snap["id"]) or JobRecord(id=snap["id"])
-                for key in ("block_id", "block_name", "status", "submit", "total", "done",
-                            "created_at", "started_at", "finished_at", "base"):
+                for key in ("block_id", "block_name", "status", "source", "submit", "total",
+                            "done", "created_at", "started_at", "finished_at", "base"):
                     setattr(rec, key, snap[key])
+                rec.updated_at = _now()
                 rec.results = [_light(r) for r in snap["results"]]
                 # Протокол перезаписываем, только когда он поменялся: обращение
                 # к отложенной колонке тянуло бы десятки КБ на каждый шаг.
@@ -207,22 +245,44 @@ class JobManager:
         if not self.persist:
             return
         with get_session() as s:
-            for rec in s.query(JobRecord).filter(JobRecord.status.in_(ACTIVE)).all():
-                results = copy.deepcopy(rec.results or [])
-                for r in results:
-                    if r.get("status") == "running":
-                        r["status"] = "unconfirmed"
-                        r["errors"] = (r.get("errors") or []) + [
-                            "Сервер перезапустился во время заполнения этой формы — "
-                            "неизвестно, ушла ли она. Проверьте в ответах формы."]
-                    elif r.get("status") == "pending":
-                        r["status"] = "failed"
-                        r["errors"] = (r.get("errors") or []) + [
-                            "Не отправлялось: сервер перезапустился раньше, чем дошла очередь."]
-                rec.results = results
+            # Только задачи сервера: отправки с телефонов идут на телефонах и
+            # от перезапуска сервера не зависят.
+            for rec in s.query(JobRecord).filter(JobRecord.status.in_(ACTIVE), _server_jobs()).all():
+                rec.results = _interrupt(
+                    rec.results,
+                    "Сервер перезапустился во время заполнения этой формы — "
+                    "неизвестно, ушла ли она. Проверьте в ответах формы.",
+                    "Не отправлялось: сервер перезапустился раньше, чем дошла очередь.")
                 rec.status = "error"
                 rec.finished_at = rec.finished_at or _now()
             s.commit()
+
+    def _expire_phone_jobs(self, s):
+        """Отправка с телефона, о которой давно ничего не слышно, оборвалась
+        (разрядился телефон, приложение убили). Иначе она вечно числилась бы
+        «идущей» и не давала отправить бригаду снова."""
+        cutoff = (dt.datetime.now(dt.timezone.utc) - PHONE_STALE).isoformat(timespec="microseconds")
+        stale = (s.query(JobRecord)
+                 .filter(JobRecord.source == "phone", JobRecord.status.in_(ACTIVE),
+                         or_(JobRecord.updated_at.is_(None), JobRecord.updated_at < cutoff))
+                 .all())
+        for rec in stale:
+            rec.results = _interrupt(
+                rec.results,
+                "Телефон перестал выходить на связь во время заполнения этой формы — "
+                "неизвестно, ушла ли она.",
+                "Не отправлялось: телефон перестал выходить на связь.")
+            rec.status = "error"
+            rec.finished_at = rec.finished_at or _now()
+        if stale:
+            s.commit()
+
+    def _active_phone_job(self, s, block_id: int) -> Optional[JobRecord]:
+        self._expire_phone_jobs(s)
+        return (s.query(JobRecord)
+                .filter(JobRecord.block_id == block_id, JobRecord.source == "phone",
+                        JobRecord.status.in_(ACTIVE))
+                .first())
 
     def forget_block(self, block_id: int):
         """Бригаду удалили — её история больше не нужна (идущая задача доработает)."""
@@ -269,26 +329,34 @@ class JobManager:
             fields = rec.fields or []
             return copy.deepcopy(fields[index]) if index < len(fields) else []
 
-    def active_for_block(self, block_id: int) -> Optional[Job]:
+    def active_for_block(self, block_id: int) -> Optional[dict]:
+        """Идущая отправка бригады — на этом сервере или на чьём-то телефоне."""
         with self._lock:
             for job in reversed(self._jobs.values()):
                 if job.block_id == block_id and job.active:
-                    return job
-        return None
+                    return job.to_dict()
+        if not self.persist:
+            return None
+        with get_session() as s:
+            rec = self._active_phone_job(s, block_id)
+            return _record_dict(rec) if rec else None
 
     def latest_for_block(self, block_id: int) -> Optional[dict]:
         """Последняя задача бригады (идущая или завершённая) — лёгкий словарь."""
         with self._lock:
             mem = [j for j in self._jobs.values() if j.block_id == block_id]
-        if mem:
-            # Всё, что создано за жизнь процесса, лежит в памяти и новее записей БД.
-            return mem[-1].to_dict(with_fields=False)
+        best = mem[-1].to_dict(with_fields=False) if mem else None
         if not self.persist:
-            return None
+            return best
         with get_session() as s:
+            self._expire_phone_jobs(s)
             rec = (s.query(JobRecord).filter(JobRecord.block_id == block_id)
                    .order_by(JobRecord.created_at.desc()).first())
-            return _record_dict(rec) if rec else None
+            # Память свежее БД для задач сервера, но отправка с телефона живёт
+            # только в БД и может оказаться новее.
+            if rec and (best is None or (rec.created_at > best["created_at"] and rec.id != best["id"])):
+                best = _record_dict(rec)
+        return best
 
     def summaries(self, block_ids: Iterable[int]) -> Dict[int, dict]:
         """Сводка по последней задаче каждой бригады — одним запросом к БД."""
@@ -296,6 +364,7 @@ class JobManager:
         out: Dict[int, dict] = {}
         if self.persist and ids:
             with get_session() as s:
+                self._expire_phone_jobs(s)
                 recs = (s.query(JobRecord).filter(JobRecord.block_id.in_(ids))
                         .order_by(JobRecord.created_at.desc()).all())
                 for rec in recs:
@@ -303,10 +372,69 @@ class JobManager:
                         out[rec.block_id] = _summary(_record_dict(rec))
         with self._lock:
             mem = list(self._jobs.values())
-        for job in mem:                      # память свежее БД
+        for job in mem:                      # память свежее БД (если задача не старше)
             if job.block_id in ids:
-                out[job.block_id] = _summary(job.to_dict())
+                cur = out.get(job.block_id)
+                if cur is None or cur["id"] == job.id or job.created_at >= cur["created_at"]:
+                    out[job.block_id] = _summary(job.to_dict())
         return out
+
+    # ---------- отправки с телефона ----------
+
+    def phone_start(self, block_id: int, block_name: str, job_id: str, names: List[str],
+                    base: dict, submit: bool) -> dict:
+        """Телефон начинает отправку бригады. JobBusy — если она уже идёт
+        (на сервере или на другом телефоне)."""
+        if not self.persist:
+            raise RuntimeError("Отправки с телефона требуют БД")
+        with self._lock:           # тот же замок, что у start(): проверка и запись — атомарно
+            for other in self._jobs.values():
+                if other.block_id == block_id and other.active:
+                    raise JobBusy(other)
+            with get_session() as s:
+                busy = self._active_phone_job(s, block_id)
+                if busy is not None and busy.id != job_id:
+                    raise JobBusy(_RecordRef(busy.id))
+                rec = s.get(JobRecord, job_id)
+                if rec is not None:              # повтор того же запроса (сеть моргнула)
+                    return _record_dict(rec)
+                now = _now()
+                rec = JobRecord(
+                    id=job_id, block_id=block_id, block_name=block_name, status="running",
+                    source="phone", submit=submit, total=len(names), done=0,
+                    created_at=now, started_at=now, updated_at=now, base=base,
+                    results=[{"worker_id": None, "full_name": n, "status": "pending",
+                              "submitted": False, "steps": [], "errors": [], "warnings": [],
+                              "elapsed": 0.0, "fields_total": 0, "fields_verified": 0}
+                             for n in names],
+                    fields=[[] for _ in names],
+                )
+                s.add(rec)
+                s.commit()
+                out = _record_dict(rec)
+        self._trim(block_id)
+        return out
+
+    def phone_update(self, job_id: str, status: str, done: int, results: list,
+                     fields: Optional[list], finished_at: Optional[str]) -> Optional[dict]:
+        """Телефон присылает ход отправки. None — нет такой отправки с телефона."""
+        if not self.persist:
+            return None
+        with get_session() as s:
+            rec = s.get(JobRecord, job_id)
+            if rec is None or rec.source != "phone":
+                return None
+            rec.status = status
+            rec.done = done
+            rec.total = max(rec.total or 0, len(results))
+            rec.results = results
+            if fields is not None:
+                rec.fields = fields
+            if status not in ACTIVE:
+                rec.finished_at = finished_at or rec.finished_at or _now()
+            rec.updated_at = _now()
+            s.commit()
+            return _record_dict(rec)
 
     # ---------- запуск ----------
 
@@ -321,6 +449,11 @@ class JobManager:
                 for other in self._jobs.values():
                     if other.block_id == block_id and other.active:
                         raise JobBusy(other)
+                if self.persist:          # …и не идёт ли она на чьём-то телефоне
+                    with get_session() as s:
+                        busy = self._active_phone_job(s, block_id)
+                        if busy is not None:
+                            raise JobBusy(_RecordRef(busy.id))
             self._jobs[job_id] = job
             self._evict_locked()
         self._save(job, with_fields=True)
