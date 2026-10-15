@@ -3,7 +3,7 @@
 API-only сервис (фронтенд деплоится отдельным проектом)."""
 import os
 from contextlib import asynccontextmanager
-from typing import Literal, Optional
+from typing import Annotated, List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from db import init_db, get_session, Block, Worker
 from engine import answers as A
-from jobs import JobManager
+from jobs import JobBusy, JobManager
 
 # headless из окружения (на сервере — да). HEADLESS=0 для отладки с окном.
 HEADLESS = os.environ.get("HEADLESS", "1") != "0"
@@ -29,6 +29,7 @@ ObjectKey = Literal["sulphide_1", "sulphide_2"]
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    jobs.recover()
     yield
 
 
@@ -70,6 +71,14 @@ class WorkerIn(BaseModel):
     full_name: str = Field(default="", max_length=300)
 
 
+FullName = Annotated[str, Field(max_length=300)]
+
+
+class WorkersIn(BaseModel):
+    """Весь состав бригады целиком, в порядке на экране."""
+    names: List[FullName] = Field(default_factory=list, max_length=100)
+
+
 class SubmitIn(BaseModel):
     workplace: str = Field(..., max_length=1000)
     submit: bool = True          # «Отправить» в UI = реальная отправка
@@ -77,6 +86,10 @@ class SubmitIn(BaseModel):
     task: Optional[TaskKey] = None
     object_key: Optional[ObjectKey] = None
     company: Optional[str] = Field(default=None, max_length=300)
+    # Состав ровно таким, каким его видит бригадир в момент нажатия. Если
+    # передан — сохраняется в бригаду и отправляется именно он, а не то,
+    # что успело (или не успело) долететь до БД отложенными сохранениями.
+    names: Optional[List[FullName]] = Field(default=None, max_length=100)
 
 
 class PreviewIn(BaseModel):
@@ -120,7 +133,14 @@ def preview(data: PreviewIn):
 # ---------- блоки ----------
 @app.get("/api/blocks")
 def list_blocks(s: Session = Depends(db)):
-    return [b.to_dict() for b in s.query(Block).order_by(Block.id).all()]
+    blocks = s.query(Block).order_by(Block.id).all()
+    last = jobs.summaries(b.id for b in blocks)
+    out = []
+    for b in blocks:
+        d = b.to_dict()
+        d["last_job"] = last.get(b.id)      # идёт ли отправка / чем кончилась
+        out.append(d)
+    return out
 
 
 @app.post("/api/blocks")
@@ -157,10 +177,42 @@ def delete_block(block_id: int, s: Session = Depends(db)):
     if not b:
         raise HTTPException(404, "Блок не найден")
     s.delete(b); s.commit()
+    jobs.forget_block(block_id)
     return {"ok": True}
 
 
 # ---------- работники ----------
+def _replace_workers(s: Session, b: Block, names: List[str]):
+    """Привести состав бригады к списку names (пустые строки отбрасываются).
+
+    Существующие строки переиспользуются по порядку, лишние удаляются."""
+    names = [n.strip() for n in names if n and n.strip()]
+    existing = list(b.workers)
+    for i, name in enumerate(names):
+        if i < len(existing):
+            existing[i].full_name = name
+            existing[i].order_index = i
+        else:
+            b.workers.append(Worker(full_name=name, order_index=i))
+    for w in existing[len(names):]:
+        b.workers.remove(w)                 # delete-orphan удалит строку
+    s.commit(); s.refresh(b)
+
+
+@app.put("/api/blocks/{block_id}/workers")
+def set_workers(block_id: int, data: WorkersIn, s: Session = Depends(db)):
+    """Сохранить состав целиком одним запросом.
+
+    Раньше каждое ФИО сохранялось своим PATCH с задержкой, а добавление шло
+    через POST+PATCH. Стоило выйти из бригады до того, как они долетят, —
+    экран показывал старый состав, а правка поверх него затирала новый."""
+    b = s.get(Block, block_id)
+    if not b:
+        raise HTTPException(404, "Блок не найден")
+    _replace_workers(s, b, data.names)
+    return b.to_dict()
+
+
 @app.post("/api/blocks/{block_id}/workers")
 def add_worker(block_id: int, data: WorkerIn, s: Session = Depends(db)):
     b = s.get(Block, block_id)
@@ -200,6 +252,10 @@ def submit_block(block_id: int, data: SubmitIn, s: Session = Depends(db)):
     b = s.get(Block, block_id)
     if not b:
         raise HTTPException(404, "Блок не найден")
+    if jobs.active_for_block(block_id):
+        raise HTTPException(409, "По этой бригаде уже идёт отправка")
+    if data.names is not None:
+        _replace_workers(s, b, data.names)
     workers = []
     for w in b.workers:
         full_name = (w.full_name or "").strip()
@@ -227,8 +283,20 @@ def submit_block(block_id: int, data: SubmitIn, s: Session = Depends(db)):
         "object_key": b.object_key,
         "company": b.company.strip(),
     }
-    job = jobs.start(b.name, workers, base, submit=data.submit)
+    try:
+        job = jobs.start(b.id, b.name, workers, base, submit=data.submit)
+    except JobBusy:
+        raise HTTPException(409, "По этой бригаде уже идёт отправка")
     return job.to_dict()
+
+
+@app.get("/api/blocks/{block_id}/job")
+def block_job(block_id: int):
+    """Последняя отправка бригады (идущая или завершённая), либо null.
+
+    По ней клиент, вернувшись из фона или после перезагрузки страницы,
+    снова находит задачу и показывает её ход и итог."""
+    return jobs.latest_for_block(block_id)
 
 
 @app.get("/api/jobs/{job_id}")
@@ -237,7 +305,7 @@ def job_status(job_id: str):
     job = jobs.get(job_id)
     if not job:
         raise HTTPException(404, "Задача не найдена")
-    return job.to_dict(with_fields=False)
+    return job
 
 
 @app.get("/api/jobs/{job_id}/fields/{index}")
@@ -246,10 +314,7 @@ def job_fields(job_id: str, index: int):
 
     Запрашивается только когда пользователь раскрыл плашку — иначе опрос
     прогресса возил бы по мобильной сети десятки килобайт каждые 1.5 с."""
-    job = jobs.get(job_id)
-    if not job:
-        raise HTTPException(404, "Задача не найдена")
-    fields = job.fields_of(index)
+    fields = jobs.fields_of(job_id, index)
     if fields is None:
-        raise HTTPException(404, "Работник не найден в задаче")
+        raise HTTPException(404, "Задача или работник не найдены")
     return {"fields": fields}

@@ -2,7 +2,9 @@
 """БД: блоки (бригады) и работники. Postgres (Railway) или SQLite локально."""
 import os
 import datetime as dt
-from sqlalchemy import (create_engine, Integer, String, Text, DateTime, ForeignKey)
+from typing import Optional
+from sqlalchemy import (create_engine, Integer, String, Text, DateTime, ForeignKey,
+                        Boolean, JSON)
 from sqlalchemy.orm import (DeclarativeBase, Mapped, mapped_column, relationship,
                             sessionmaker)
 
@@ -80,6 +82,30 @@ class Worker(Base):
 
     def to_dict(self):
         return {"id": self.id, "full_name": self.full_name, "order_index": self.order_index}
+
+
+class JobRecord(Base):
+    """Отправка за бригаду. Хранится в БД, а не только в памяти процесса:
+    бригадир сворачивает приложение, телефон выгружает вкладку — вернувшись,
+    он должен увидеть ход и итог отправки, а не пустую форму с активной
+    кнопкой (и не отправить бригаду второй раз)."""
+    __tablename__ = "jobs"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    # Без внешнего ключа: задача доживает до конца, даже если бригаду удалили.
+    block_id: Mapped[Optional[int]] = mapped_column(Integer, index=True, nullable=True)
+    block_name: Mapped[str] = mapped_column(String(200), default="")
+    status: Mapped[str] = mapped_column(String(20), default="queued")   # queued|running|done|error
+    submit: Mapped[bool] = mapped_column(Boolean, default=True)
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    done: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[str] = mapped_column(String(40), default="", index=True)  # ISO UTC
+    started_at: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    finished_at: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    base: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Результаты без протокола полей — их читает каждый опрос прогресса.
+    results: Mapped[list] = mapped_column(JSON, default=list)
+    # Протокол полей по работникам (десятки КБ) — грузится только по запросу.
+    fields: Mapped[list] = mapped_column(JSON, default=list, deferred=True)
 
 
 def init_db():
